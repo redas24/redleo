@@ -1,21 +1,36 @@
 #!/usr/bin/env bash
 #
 # redpac — installs the "main programs" of this setup (the st terminal,
-# the fish shell, and the Nyxt web browser) through whatever native
-# package manager the host distro provides: pacman on Arch Linux, or
-# emerge/Portage on Gentoo. Because installation goes through the real
-# package manager, required libraries are pulled in automatically as
-# ordinary dependencies — there is no separate "install libs" step.
+# the fish shell, the Nyxt web browser, and Neovim configured with
+# LazyVim as the editor) through whatever native package manager the
+# host distro provides: pacman on Arch Linux, or emerge/Portage on
+# Gentoo. Because installation goes through the real package manager,
+# required libraries are pulled in automatically as ordinary
+# dependencies — there is no separate "install libs" step.
 #
 # Usage:
-#   redpac install <st|fish|nyxt|all>
+#   redpac install <st|fish|nyxt|lazyvim|all>
 #   redpac list
 #   redpac help
 
 set -euo pipefail
 
 prog_name="redpac"
-managed_packages=(fish st nyxt)
+managed_packages=(fish st nyxt lazyvim)
+
+# is_installed reports whether the named managed package is already set
+# up. lazyvim is special-cased: it's "installed" once Neovim is present
+# and pointed at a LazyVim config, not a binary of its own.
+is_installed() {
+	case "$1" in
+	lazyvim)
+		command -v nvim >/dev/null 2>&1 && [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/nvim/lua/config/lazy.lua" ]
+		;;
+	*)
+		command -v "$1" >/dev/null 2>&1
+		;;
+	esac
+}
 
 # detect_pm prints the package manager found on this host: "pacman",
 # "emerge", or "none".
@@ -76,7 +91,7 @@ EOF
 
 # install_fish installs the fish shell.
 install_fish() {
-	if command -v fish >/dev/null 2>&1; then
+	if is_installed fish; then
 		echo "fish: already installed"
 		return 0
 	fi
@@ -92,7 +107,7 @@ install_fish() {
 
 # install_st installs the suckless st terminal.
 install_st() {
-	if command -v st >/dev/null 2>&1; then
+	if is_installed st; then
 		echo "st: already installed"
 		return 0
 	fi
@@ -110,7 +125,7 @@ install_st() {
 # and lives outside the main Portage tree on Gentoo, so both branches
 # fall back to clear manual instructions when the automatic path fails.
 install_nyxt() {
-	if command -v nyxt >/dev/null 2>&1; then
+	if is_installed nyxt; then
 		echo "nyxt: already installed"
 		return 0
 	fi
@@ -157,14 +172,51 @@ EOF
 	return 1
 }
 
+# install_lazyvim installs Neovim plus its build/runtime tooling, then
+# bootstraps the LazyVim starter config into $XDG_CONFIG_HOME/nvim if no
+# Neovim config exists there yet. It never overwrites an existing config.
+install_lazyvim() {
+	if is_installed lazyvim; then
+		echo "lazyvim: already installed"
+		return 0
+	fi
+
+	if ! command -v nvim >/dev/null 2>&1; then
+		case "$pm" in
+		pacman)
+			as_root pacman -Sy --needed --noconfirm neovim git ripgrep fd
+			;;
+		emerge)
+			as_root emerge --ask=n app-editors/neovim dev-vcs/git sys-apps/ripgrep sys-apps/fd
+			;;
+		esac
+	fi
+
+	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/nvim"
+	if [ -e "$config_dir" ]; then
+		cat >&2 <<EOF
+$prog_name: $config_dir already exists, leaving it alone.
+To switch it to LazyVim yourself:
+  mv $config_dir ${config_dir}.bak
+  git clone https://github.com/LazyVim/starter $config_dir
+  rm -rf $config_dir/.git
+EOF
+		return 1
+	fi
+
+	git clone --depth=1 https://github.com/LazyVim/starter "$config_dir"
+	rm -rf "$config_dir/.git"
+	echo "lazyvim: installed into $config_dir (run 'nvim' once to finish bootstrapping plugins)"
+}
+
 list_status() {
 	echo "package manager: $pm"
 	local p
 	for p in "${managed_packages[@]}"; do
-		if command -v "$p" >/dev/null 2>&1; then
-			printf "  %-6s installed (%s)\n" "$p" "$(command -v "$p")"
+		if is_installed "$p"; then
+			printf "  %-8s installed\n" "$p"
 		else
-			printf "  %-6s not installed\n" "$p"
+			printf "  %-8s not installed\n" "$p"
 		fi
 	done
 }
@@ -177,11 +229,13 @@ main() {
 		fish) install_fish ;;
 		st) install_st ;;
 		nyxt) install_nyxt ;;
+		lazyvim) install_lazyvim ;;
 		all)
 			local failed=0
 			install_fish || failed=1
 			install_st || failed=1
 			install_nyxt || failed=1
+			install_lazyvim || failed=1
 			exit "$failed"
 			;;
 		*)
