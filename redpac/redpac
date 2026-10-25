@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+#
+# redpac — installs the "main programs" of this setup (the st terminal,
+# the fish shell, and the Nyxt web browser) through whatever native
+# package manager the host distro provides: pacman on Arch Linux, or
+# emerge/Portage on Gentoo. Because installation goes through the real
+# package manager, required libraries are pulled in automatically as
+# ordinary dependencies — there is no separate "install libs" step.
+#
+# Usage:
+#   redpac install <st|fish|nyxt|all>
+#   redpac list
+#   redpac help
+
+set -euo pipefail
+
+prog_name="redpac"
+managed_packages=(fish st nyxt)
+
+# detect_pm prints the package manager found on this host: "pacman",
+# "emerge", or "none".
+detect_pm() {
+	if command -v pacman >/dev/null 2>&1; then
+		echo "pacman"
+	elif command -v emerge >/dev/null 2>&1; then
+		echo "emerge"
+	else
+		echo "none"
+	fi
+}
+
+# aur_helper prints the first AUR helper found in PATH (yay, paru), or
+# nothing if none is installed.
+aur_helper() {
+	local helper
+	for helper in yay paru; do
+		if command -v "$helper" >/dev/null 2>&1; then
+			echo "$helper"
+			return
+		fi
+	done
+}
+
+# as_root runs its arguments as root, via sudo if we aren't already root.
+as_root() {
+	if [ "$(id -u)" -eq 0 ]; then
+		"$@"
+	else
+		sudo "$@"
+	fi
+}
+
+pm="$(detect_pm)"
+
+require_pm() {
+	if [ "$pm" = "none" ]; then
+		echo "$prog_name: no supported package manager found (need pacman on Arch Linux or emerge on Gentoo)" >&2
+		exit 1
+	fi
+}
+
+usage() {
+	cat <<EOF
+usage: $prog_name <command> [package]
+
+commands:
+  install <pkg|all>   install one of: ${managed_packages[*]}, or all of them
+  list                show which managed packages are installed
+  help                show this help
+
+$prog_name installs through your distro's native package manager
+(pacman on Arch Linux, emerge/Portage on Gentoo), so required
+libraries come in automatically as ordinary dependencies.
+EOF
+}
+
+# install_fish installs the fish shell.
+install_fish() {
+	if command -v fish >/dev/null 2>&1; then
+		echo "fish: already installed"
+		return 0
+	fi
+	case "$pm" in
+	pacman)
+		as_root pacman -Sy --needed --noconfirm fish
+		;;
+	emerge)
+		as_root emerge --ask=n app-shells/fish
+		;;
+	esac
+}
+
+# install_st installs the suckless st terminal.
+install_st() {
+	if command -v st >/dev/null 2>&1; then
+		echo "st: already installed"
+		return 0
+	fi
+	case "$pm" in
+	pacman)
+		as_root pacman -Sy --needed --noconfirm st
+		;;
+	emerge)
+		as_root emerge --ask=n x11-terms/st
+		;;
+	esac
+}
+
+# install_nyxt installs the Nyxt web browser. Nyxt is AUR-only on Arch
+# and lives outside the main Portage tree on Gentoo, so both branches
+# fall back to clear manual instructions when the automatic path fails.
+install_nyxt() {
+	if command -v nyxt >/dev/null 2>&1; then
+		echo "nyxt: already installed"
+		return 0
+	fi
+	case "$pm" in
+	pacman)
+		install_nyxt_pacman
+		;;
+	emerge)
+		install_nyxt_emerge
+		;;
+	esac
+}
+
+install_nyxt_pacman() {
+	local helper
+	helper="$(aur_helper)"
+	if [ -n "$helper" ]; then
+		"$helper" -S --needed --noconfirm nyxt-bin && return 0
+		"$helper" -S --needed --noconfirm nyxt && return 0
+	fi
+	cat >&2 <<EOF
+$prog_name: nyxt is AUR-only and no AUR helper (yay/paru) was found.
+Install one first (e.g. 'pacman -S --needed yay'), or build it manually:
+  git clone https://aur.archlinux.org/nyxt-bin.git
+  cd nyxt-bin && makepkg -si
+EOF
+	return 1
+}
+
+install_nyxt_emerge() {
+	local category
+	for category in www-client/nyxt net-www/nyxt; do
+		if as_root emerge --ask=n "$category" 2>/dev/null; then
+			return 0
+		fi
+	done
+	cat >&2 <<EOF
+$prog_name: nyxt was not found in the main Portage tree.
+Enable the GURU overlay and try again:
+  sudo eselect repository enable guru
+  sudo emaint sync --repo guru
+  sudo emerge --ask=n www-client/nyxt
+EOF
+	return 1
+}
+
+list_status() {
+	echo "package manager: $pm"
+	local p
+	for p in "${managed_packages[@]}"; do
+		if command -v "$p" >/dev/null 2>&1; then
+			printf "  %-6s installed (%s)\n" "$p" "$(command -v "$p")"
+		else
+			printf "  %-6s not installed\n" "$p"
+		fi
+	done
+}
+
+main() {
+	case "${1:-help}" in
+	install)
+		require_pm
+		case "${2:-}" in
+		fish) install_fish ;;
+		st) install_st ;;
+		nyxt) install_nyxt ;;
+		all)
+			local failed=0
+			install_fish || failed=1
+			install_st || failed=1
+			install_nyxt || failed=1
+			exit "$failed"
+			;;
+		*)
+			echo "$prog_name: unknown package '${2:-}' (want one of: ${managed_packages[*]}, all)" >&2
+			usage
+			exit 1
+			;;
+		esac
+		;;
+	list)
+		require_pm
+		list_status
+		;;
+	help | --help | -h)
+		usage
+		;;
+	*)
+		echo "$prog_name: unknown command '$1'" >&2
+		usage
+		exit 1
+		;;
+	esac
+}
+
+main "$@"
