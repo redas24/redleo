@@ -5,16 +5,15 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"sync"
+	"time"
 
 	"github.com/jezek/xgb"
+	"github.com/jezek/xgb/screensaver"
 	"github.com/jezek/xgb/xproto"
 )
 
-// xkReturn is the X keysym for the Return/Enter key (from <X11/keysymdef.h>).
-const xkReturn xproto.Keysym = 0xff0d
-
-// wm holds the window manager's connection state and the window currently
-// being dragged (moved or resized), if any.
+// wm holds the window manager's connection and runtime state.
 type wm struct {
 	conn *xgb.Conn
 	root xproto.Window
@@ -22,10 +21,13 @@ type wm struct {
 	atomWMProtocols    xproto.Atom
 	atomWMDeleteWindow xproto.Atom
 
-	// terminalKeycode is the Return key's current keycode, grabbed with
-	// modKey to spawn a terminal. 0 if Return has no keycode on this
-	// keyboard mapping (terminal spawning is then simply disabled).
-	terminalKeycode xproto.Keycode
+	// binds maps a grabbed keycode to the bindings registered for it
+	// (there can be more than one combo sharing a physical key, e.g.
+	// super-l and super-shift-l).
+	binds map[xproto.Keycode][]runtimeBind
+
+	lockCommand []string
+	lockMu      sync.Mutex // held for the duration of a lock, to debounce
 
 	// Drag state, valid only while a button grabbed by modKey is held down.
 	dragWin            xproto.Window
@@ -36,10 +38,17 @@ type wm struct {
 	dragWinW, dragWinH uint16
 }
 
-// newWM connects the window manager's shortcuts to the root window. It
-// fails if another window manager already owns the pointer/button grabs
-// it needs.
-func newWM(conn *xgb.Conn) (*wm, error) {
+// runtimeBind is a config bind resolved to a concrete keycode's modifier
+// state and command.
+type runtimeBind struct {
+	mods    uint16
+	command []string
+}
+
+// newWM connects the window manager's shortcuts to the root window and
+// applies cfg. It fails if another window manager already owns the
+// pointer/button grabs it needs.
+func newWM(conn *xgb.Conn, cfg *config) (*wm, error) {
 	root := xproto.Setup(conn).DefaultScreen(conn).Root
 
 	wmProtocols, err := internAtom(conn, "WM_PROTOCOLS")
@@ -56,6 +65,8 @@ func newWM(conn *xgb.Conn) (*wm, error) {
 		root:               root,
 		atomWMProtocols:    wmProtocols,
 		atomWMDeleteWindow: wmDeleteWindow,
+		binds:              make(map[xproto.Keycode][]runtimeBind),
+		lockCommand:        cfg.lockCommand,
 	}
 
 	// Grab Super+Button1 (move), Super+Button2 (close) and Super+Button3
@@ -77,24 +88,32 @@ func newWM(conn *xgb.Conn) (*wm, error) {
 		}
 	}
 
-	keycode, err := keycodeForKeysym(conn, xkReturn)
-	if err != nil {
-		log.Printf("looking up Return keycode: %v (Super+Return will not spawn a terminal)", err)
-	} else {
-		if err := xproto.GrabKeyChecked(conn, true, root, modKey, keycode,
-			xproto.GrabModeAsync, xproto.GrabModeAsync).Check(); err != nil {
-			log.Printf("grabbing Super+Return: %v (Super+Return will not spawn a terminal)", err)
-		} else {
-			w.terminalKeycode = keycode
+	for _, b := range cfg.binds {
+		keycode, err := keycodeForKeysym(conn, b.keysym)
+		if err != nil {
+			log.Printf("bind for keysym 0x%x: %v (skipping)", b.keysym, err)
+			continue
 		}
+		if err := xproto.GrabKeyChecked(conn, true, root, b.mods, keycode,
+			xproto.GrabModeAsync, xproto.GrabModeAsync).Check(); err != nil {
+			log.Printf("grabbing bind (keycode %d, mods 0x%x): %v (skipping)", keycode, b.mods, err)
+			continue
+		}
+		w.binds[keycode] = append(w.binds[keycode], runtimeBind{mods: b.mods, command: b.command})
 	}
+
+	for _, cmd := range cfg.autostart {
+		w.spawnCommand(cmd)
+	}
+
+	go w.watchIdle(cfg.idleSeconds)
 
 	return w, nil
 }
 
 // run is the main event loop. It blocks forever handling X events.
 func (w *wm) run() {
-	log.Printf("simplewm running (Super+drag to move/resize, Super+middle-click to close, Super+Return to open a terminal)")
+	log.Printf("simplewm running")
 	for {
 		event, err := w.conn.WaitForEvent()
 		if err != nil {
@@ -181,38 +200,16 @@ func (w *wm) onButtonRelease(e xproto.ButtonReleaseEvent) {
 	w.dragWin = xproto.WindowNone
 }
 
-// onKeyPress spawns a terminal when Super+Return is pressed.
+// onKeyPress dispatches to whichever configured bind matches both the
+// keycode and the modifier state that were actually pressed.
 func (w *wm) onKeyPress(e xproto.KeyPressEvent) {
-	if w.terminalKeycode != 0 && e.Detail == w.terminalKeycode {
-		spawnTerminal()
-	}
-}
-
-// spawnTerminal launches the user's terminal of choice, detached from
-// simplewm so it keeps running after simplewm exits. It tries
-// $SIMPLEWM_TERMINAL first, falling back to st (see redpac/) and then
-// xterm, whichever is found first in $PATH.
-func spawnTerminal() {
-	candidates := []string{"st", "xterm"}
-	if custom := os.Getenv("SIMPLEWM_TERMINAL"); custom != "" {
-		candidates = append([]string{custom}, candidates...)
-	}
-
-	for _, name := range candidates {
-		path, err := exec.LookPath(name)
-		if err != nil {
-			continue
+	const relevantMods = xproto.ModMask4 | xproto.ModMaskShift
+	for _, rb := range w.binds[e.Detail] {
+		if uint16(e.State)&relevantMods == rb.mods {
+			w.spawnCommand(rb.command)
+			return
 		}
-		cmd := exec.Command(path)
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
-		if err := cmd.Start(); err != nil {
-			log.Printf("spawning %s: %v", name, err)
-			continue
-		}
-		go cmd.Wait() // reap the child without blocking the event loop
-		return
 	}
-	log.Printf("no terminal found (tried $SIMPLEWM_TERMINAL, st, xterm)")
 }
 
 // raiseAndFocus brings win to the top of the stack and gives it input focus.
@@ -265,6 +262,106 @@ func (w *wm) supportsDeleteWindow(win xproto.Window) bool {
 	return false
 }
 
+// watchIdle locks the screen after idleSeconds of no keyboard/mouse
+// input, using the X MIT-SCREEN-SAVER extension to query idle time. A
+// non-positive idleSeconds disables it entirely.
+func (w *wm) watchIdle(idleSeconds int) {
+	if idleSeconds <= 0 {
+		return
+	}
+	if err := screensaver.Init(w.conn); err != nil {
+		log.Printf("idle auto-lock disabled: %v", err)
+		return
+	}
+
+	threshold := uint32(idleSeconds) * 1000
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		info, err := screensaver.QueryInfo(w.conn, xproto.Drawable(w.root)).Reply()
+		if err != nil {
+			log.Printf("querying idle time: %v", err)
+			continue
+		}
+		if info.MsSinceUserInput >= threshold {
+			go w.lockScreen()
+		}
+	}
+}
+
+// lockScreen runs the configured lock command, debounced so repeated
+// triggers (idle polling, a repeated keypress) never start it twice at
+// once.
+func (w *wm) lockScreen() {
+	if !w.lockMu.TryLock() {
+		return
+	}
+	defer w.lockMu.Unlock()
+
+	if len(w.lockCommand) == 0 {
+		return
+	}
+	path, err := exec.LookPath(w.lockCommand[0])
+	if err != nil {
+		log.Printf("locking screen: %v", err)
+		return
+	}
+	if err := exec.Command(path, w.lockCommand[1:]...).Run(); err != nil {
+		log.Printf("running screen locker: %v", err)
+	}
+}
+
+// spawnCommand runs a config command line. "$TERMINAL" and "$LOCK" are
+// resolved specially; everything else is looked up in $PATH and run
+// directly -- never through a shell, so config files can't be used for
+// shell-injection tricks even though they're plain, user-editable text.
+func (w *wm) spawnCommand(tokens []string) {
+	if len(tokens) == 0 {
+		return
+	}
+	switch tokens[0] {
+	case "$TERMINAL":
+		w.spawnTerminal(tokens[1:])
+	case "$LOCK":
+		go w.lockScreen()
+	default:
+		spawnGeneric(tokens[0], tokens[1:])
+	}
+}
+
+// spawnTerminal launches the user's terminal of choice, passing extraArgs
+// through to it. It tries $SIMPLEWM_TERMINAL first, then st (see
+// redpac/), then xterm -- whichever is found first in $PATH.
+func (w *wm) spawnTerminal(extraArgs []string) {
+	candidates := []string{"st", "xterm"}
+	if custom := os.Getenv("SIMPLEWM_TERMINAL"); custom != "" {
+		candidates = append([]string{custom}, candidates...)
+	}
+	for _, name := range candidates {
+		if spawnGeneric(name, extraArgs) {
+			return
+		}
+	}
+	log.Printf("no terminal found (tried $SIMPLEWM_TERMINAL, st, xterm)")
+}
+
+// spawnGeneric looks up name in $PATH and runs it, detached from
+// simplewm so it keeps running after simplewm exits. It reports whether
+// the command was found and started.
+func spawnGeneric(name string, args []string) bool {
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return false
+	}
+	cmd := exec.Command(path, args...)
+	if err := cmd.Start(); err != nil {
+		log.Printf("spawning %s: %v", name, err)
+		return false
+	}
+	go cmd.Wait() // reap the child without blocking the event loop
+	return true
+}
+
 // internAtom looks up (creating if necessary) the X atom for name.
 func internAtom(conn *xgb.Conn, name string) (xproto.Atom, error) {
 	reply, err := xproto.InternAtom(conn, false, uint16(len(name)), name).Reply()
@@ -275,8 +372,8 @@ func internAtom(conn *xgb.Conn, name string) (xproto.Atom, error) {
 }
 
 // keycodeForKeysym looks up the keycode the X server's current keyboard
-// mapping assigns to keysym (e.g. Return), so a key grab survives
-// whatever physical keyboard layout is active.
+// mapping assigns to keysym, so a key grab survives whatever physical
+// keyboard layout is active.
 func keycodeForKeysym(conn *xgb.Conn, keysym xproto.Keysym) (xproto.Keycode, error) {
 	setup := xproto.Setup(conn)
 	count := byte(setup.MaxKeycode - setup.MinKeycode + 1)

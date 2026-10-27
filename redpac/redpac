@@ -1,30 +1,37 @@
 #!/usr/bin/env bash
 #
 # redpac — installs the "main programs" of this setup (the st terminal,
-# the fish shell, the Nyxt web browser, and Neovim configured with
-# LazyVim as the editor) through whatever native package manager the
-# host distro provides: pacman on Arch Linux, or emerge/Portage on
-# Gentoo. Because installation goes through the real package manager,
-# required libraries are pulled in automatically as ordinary
-# dependencies — there is no separate "install libs" step.
+# the fish shell, the Nyxt web browser, Neovim configured with LazyVim,
+# and a couple of devops tools: the bottom system monitor, the
+# lazydocker Docker TUI, and the slock screen locker) through whatever
+# native package manager the host distro provides: pacman on Arch
+# Linux, or emerge/Portage on Gentoo. Because installation goes through
+# the real package manager, required libraries are pulled in
+# automatically as ordinary dependencies — there is no separate
+# "install libs" step.
 #
 # Usage:
-#   redpac install <st|fish|nyxt|lazyvim|all>
+#   redpac install <st|fish|nyxt|lazyvim|bottom|lazydocker|slock|all>
 #   redpac list
 #   redpac help
 
 set -euo pipefail
 
 prog_name="redpac"
-managed_packages=(fish st nyxt lazyvim)
+managed_packages=(fish st nyxt lazyvim bottom lazydocker slock)
 
 # is_installed reports whether the named managed package is already set
 # up. lazyvim is special-cased: it's "installed" once Neovim is present
-# and pointed at a LazyVim config, not a binary of its own.
+# and pointed at a LazyVim config, not a binary of its own. bottom is
+# special-cased because its package name doesn't match its binary name
+# (the binary is called btm).
 is_installed() {
 	case "$1" in
 	lazyvim)
 		command -v nvim >/dev/null 2>&1 && [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/nvim/lua/config/lazy.lua" ]
+		;;
+	bottom)
+		command -v btm >/dev/null 2>&1
 		;;
 	*)
 		command -v "$1" >/dev/null 2>&1
@@ -209,14 +216,80 @@ EOF
 	echo "lazyvim: installed into $config_dir (run 'nvim' once to finish bootstrapping plugins)"
 }
 
+# install_bottom installs the bottom system/process monitor (binary: btm).
+install_bottom() {
+	if is_installed bottom; then
+		echo "bottom: already installed"
+		return 0
+	fi
+	case "$pm" in
+	pacman)
+		as_root pacman -Sy --needed --noconfirm bottom
+		;;
+	emerge)
+		as_root emerge --ask=n sys-process/bottom
+		;;
+	esac
+}
+
+# install_slock installs the suckless slock screen locker.
+install_slock() {
+	if is_installed slock; then
+		echo "slock: already installed"
+		return 0
+	fi
+	case "$pm" in
+	pacman)
+		as_root pacman -Sy --needed --noconfirm slock
+		;;
+	emerge)
+		as_root emerge --ask=n x11-misc/slock
+		;;
+	esac
+}
+
+# install_lazydocker installs the lazydocker Docker/Compose TUI. It's an
+# official Arch package, but on Gentoo it currently lives only in
+# third-party overlays, so that branch falls back to clear instructions.
+install_lazydocker() {
+	if is_installed lazydocker; then
+		echo "lazydocker: already installed"
+		return 0
+	fi
+	case "$pm" in
+	pacman)
+		as_root pacman -Sy --needed --noconfirm lazydocker
+		;;
+	emerge)
+		install_lazydocker_emerge
+		;;
+	esac
+}
+
+install_lazydocker_emerge() {
+	if as_root emerge --ask=n app-containers/lazydocker 2>/dev/null; then
+		return 0
+	fi
+	cat >&2 <<EOF
+$prog_name: lazydocker was not found in the main Portage tree (it
+currently only lives in third-party overlays). Try the GURU overlay:
+  sudo eselect repository enable guru
+  sudo emaint sync --repo guru
+  sudo emerge --ask=n app-containers/lazydocker
+If that doesn't have it either, install it directly with Go:
+  go install github.com/jesseduffield/lazydocker@latest
+EOF
+	return 1
+}
+
 list_status() {
 	echo "package manager: $pm"
 	local p
 	for p in "${managed_packages[@]}"; do
 		if is_installed "$p"; then
-			printf "  %-8s installed\n" "$p"
+			printf "  %-11s installed\n" "$p"
 		else
-			printf "  %-8s not installed\n" "$p"
+			printf "  %-11s not installed\n" "$p"
 		fi
 	done
 }
@@ -230,12 +303,18 @@ main() {
 		st) install_st ;;
 		nyxt) install_nyxt ;;
 		lazyvim) install_lazyvim ;;
+		bottom) install_bottom ;;
+		lazydocker) install_lazydocker ;;
+		slock) install_slock ;;
 		all)
 			local failed=0
 			install_fish || failed=1
 			install_st || failed=1
 			install_nyxt || failed=1
 			install_lazyvim || failed=1
+			install_bottom || failed=1
+			install_lazydocker || failed=1
+			install_slock || failed=1
 			exit "$failed"
 			;;
 		*)
