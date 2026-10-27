@@ -7,3 +7,6 @@
   terminal, `fish` shell, `nyxt` browser, and Neovim+LazyVim editor) via
   pacman (Arch Linux) or emerge (Gentoo). Includes keybinding
   cheatsheets for nyxt and fish.
+- [`i3backup`](i3backup) — backs up an i3 window manager environment
+  (config, status bar, compositor, launcher, notifications, X
+  resources) into a single restorable tarball.
