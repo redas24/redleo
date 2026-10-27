@@ -12,6 +12,7 @@ package main
 
 import (
 	"log"
+	"os"
 
 	"github.com/jezek/xgb"
 	"github.com/jezek/xgb/xproto"
@@ -21,13 +22,26 @@ import (
 const modKey = xproto.ModMask4 // Super / "Windows" key
 
 func main() {
+	if os.Geteuid() == 0 {
+		log.Printf("warning: running simplewm as root is not recommended")
+	}
+
+	configPath, err := defaultConfigPath()
+	if err != nil {
+		log.Fatalf("locating config file: %v", err)
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		log.Fatalf("loading config %s: %v", configPath, err)
+	}
+
 	conn, err := xgb.NewConn()
 	if err != nil {
 		log.Fatalf("connecting to X server: %v", err)
 	}
 	defer conn.Close()
 
-	wm, err := newWM(conn)
+	wm, err := newWM(conn, cfg)
 	if err != nil {
 		log.Fatalf("starting window manager: %v", err)
 	}
