@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# i3backup — snapshots an i3 window manager environment (config, status
+# bar, compositor, launcher, notifications, X resources, ...) into a
+# single restorable tarball.
+#
+# Only paths that actually exist on the host are included, so it works
+# whether i3status, polybar, picom, rofi, dunst, etc. are installed or
+# not. Paths are stored relative to $HOME, so the tarball extracts
+# straight back into place on restore.
+#
+# Usage:
+#   i3backup create [output-dir]
+#   i3backup list   <archive>
+#   i3backup restore <archive> [--force]
+#   i3backup help
+
+set -euo pipefail
+
+prog_name="i3backup"
+
+# tracked_paths lists the files/directories, relative to $HOME, that
+# make up a typical i3 setup. Entries that don't exist on this host are
+# skipped automatically.
+tracked_paths=(
+	.config/i3
+	.i3
+	.config/i3status
+	.i3status.conf
+	.config/i3status-rust
+	.config/polybar
+	.config/picom
+	.config/picom.conf
+	.picom.conf
+	.config/rofi
+	.config/dunst
+	.config/nitrogen
+	.fehbg
+	.config/dmenu
+	.Xresources
+	.xprofile
+	.xinitrc
+)
+
+usage() {
+	cat <<EOF
+usage: $prog_name <command> [args]
+
+commands:
+  create [output-dir]    back up the i3 environment into a tarball
+                          (default output-dir: current directory)
+  list <archive>         show what a backup archive contains
+  restore <archive>      restore a backup into \$HOME
+    [--force]              overwrite files already in \$HOME instead
+                            of leaving them untouched
+  help                    show this help
+
+create packages whichever of these paths exist under \$HOME:
+EOF
+	printf '  ~/%s\n' "${tracked_paths[@]}"
+}
+
+# existing_tracked_paths prints, one per line, the entries of
+# tracked_paths that exist under $HOME.
+existing_tracked_paths() {
+	local rel
+	for rel in "${tracked_paths[@]}"; do
+		if [ -e "$HOME/$rel" ]; then
+			echo "$rel"
+		fi
+	done
+}
+
+cmd_create() {
+	local out_dir="${1:-.}"
+	mkdir -p "$out_dir"
+
+	local -a found=()
+	while IFS= read -r rel; do
+		found+=("$rel")
+	done < <(existing_tracked_paths)
+
+	if [ "${#found[@]}" -eq 0 ]; then
+		echo "$prog_name: found none of the known i3 config paths under \$HOME, nothing to back up" >&2
+		exit 1
+	fi
+
+	local archive="$out_dir/i3-backup-$(hostname)-$(date +%Y%m%d-%H%M%S).tar.gz"
+	tar -czf "$archive" -C "$HOME" "${found[@]}"
+
+	echo "$prog_name: backed up ${#found[@]} path(s) to $archive"
+	printf '  ~/%s\n' "${found[@]}"
+}
+
+cmd_list() {
+	local archive="${1:?usage: $prog_name list <archive>}"
+	tar -tzf "$archive"
+}
+
+cmd_restore() {
+	local archive="${1:?usage: $prog_name restore <archive> [--force]}"
+	local force="${2:-}"
+
+	local tar_flags=(-xzf "$archive" -C "$HOME")
+	if [ "$force" = "--force" ]; then
+		tar_flags+=(--overwrite)
+	else
+		tar_flags+=(--skip-old-files)
+	fi
+
+	tar "${tar_flags[@]}"
+
+	if [ "$force" != "--force" ]; then
+		echo "$prog_name: restored $archive into \$HOME (existing files were left untouched; re-run with --force to overwrite them)"
+	else
+		echo "$prog_name: restored $archive into \$HOME, overwriting existing files"
+	fi
+}
+
+main() {
+	case "${1:-help}" in
+	create)
+		cmd_create "${2:-}"
+		;;
+	list)
+		cmd_list "${2:-}"
+		;;
+	restore)
+		cmd_restore "${2:-}" "${3:-}"
+		;;
+	help | --help | -h)
+		usage
+		;;
+	*)
+		echo "$prog_name: unknown command '${1:-}'" >&2
+		usage
+		exit 1
+		;;
+	esac
+}
+
+main "$@"
